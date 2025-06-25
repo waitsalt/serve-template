@@ -1,4 +1,4 @@
-import type { UserAuth, UserPublic } from "@/model/user";
+import type { UserAuth, UserPublic } from "./model";
 import { defineStore } from "pinia";
 import { ref } from "vue";
 

@@ -1,11 +1,10 @@
 <script lang="ts" setup>
-import { useUserStore } from "@/store/user";
+import { getUserLogout } from "@/module/user/service";
+import { useUserStore } from "@/module/user/store";
 import { ref } from "vue";
 import { onMounted } from "vue";
 import { watch } from "vue";
 import { useRouter } from "vue-router";
-
-import { getUserLogout } from "@/service/user";
 
 const router = useRouter();
 const userStore = useUserStore();

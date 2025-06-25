@@ -1,13 +1,14 @@
-import type { AppResponse } from "@/model";
+import type { AppResponse } from "@/module/model";
 import type {
   UserAuth,
   UserCreatePayload,
+  UserForgetPayload,
   UserLoginPayload,
   UserPublic,
   UserSearchPayload,
   UserUpdatePayload,
-} from "@/model/user";
-import { useUserStore } from "@/store/user";
+} from "@/module/user/model";
+import { useUserStore } from "@/module/user/store";
 import { axiosAuth, axiosBase } from "@/util/axios";
 
 async function postUserCreate(
@@ -72,10 +73,18 @@ async function userInfo(userId: string): Promise<AppResponse<UserPublic>> {
   return response;
 }
 
-async function userRefreshToken(
-  userId: string,
-): Promise<AppResponse<UserAuth>> {
+async function userRefreshToken(): Promise<AppResponse<UserAuth>> {
   const response: AppResponse<UserAuth> = await axiosAuth.post(`/user/refresh`);
+  return response;
+}
+
+async function postUserForget(
+  userForgetPayload: UserForgetPayload,
+): Promise<AppResponse<null>> {
+  const response: AppResponse<null> = await axiosBase.post(
+    "/user/forget",
+    userForgetPayload,
+  );
   return response;
 }
 
@@ -87,4 +96,6 @@ export {
   postUserLogin,
   getUserLogout,
   userInfo,
+  userRefreshToken,
+  postUserForget
 };

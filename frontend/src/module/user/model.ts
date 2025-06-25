@@ -8,7 +8,7 @@ interface User {
   userAvatarUrl: string; // 头像 url
   userLevel: number; // 0
   userStatus: number; // 0: 正常, 1: 被封禁, 2: 删除
-  userIdentity: number; // 0: 普通, 1: 管理员, 2: 超级管理员
+  userIdentity: number; // 0: 超级管理员, 1: 管理员, 2: 普通
   userCreateTime: string; // ISO日期字符串
   userUpdateTime: string; // ISO日期字符串
 }
@@ -85,6 +85,14 @@ interface UserAuth {
   refreshToken: string;
 }
 
+interface UserForgetPayload {
+  userEmail: string,
+  captchaEmail: string,
+  userPassword: string,
+  captchaImageKey: string,
+  captchaImageValue: string,
+}
+
 export type {
   User,
   UserPublic,
@@ -95,4 +103,5 @@ export type {
   UserClaim,
   UserRefreshClaim,
   UserAuth,
+  UserForgetPayload,
 };

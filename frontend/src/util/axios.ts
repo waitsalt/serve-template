@@ -1,4 +1,4 @@
-import { useUserStore } from "@/store/user";
+import { useUserStore } from "@/module/user/store";
 import axios from "axios";
 
 // 普通资源

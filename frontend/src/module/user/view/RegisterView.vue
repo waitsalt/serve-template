@@ -1,11 +1,11 @@
 <script lang="ts" setup>
 import { onMounted, ref } from "vue";
-import type { CaptchaImageResponse } from "@/model/util";
-import { getCaptchaEmail, getCaptchaImage } from "@/service/util/captcha";
 import { notify } from "@/util/notify";
-import type { UserCreatePayload } from "@/model/user";
-import { postUserCreate } from "@/service/user";
 import { useRouter } from "vue-router";
+import { getCaptchaEmail, getCaptchaImage } from "@/module/captcha/service";
+import type { CaptchaImageResponse } from "@/module/captcha/model";
+import type { UserCreatePayload } from "../model";
+import { postUserCreate } from "../service";
 
 const router = useRouter();
 
@@ -133,7 +133,7 @@ onMounted(() => {
                 </div>
             </div>
             <div class="registerTip">
-                <a @click="router.push(`/user/register`)" class="registerTipItem">忘记密码</a>
+                <a @click="router.push(`/user/forget`)" class="registerTipItem">忘记密码</a>
                 <a @click="router.push(`/user/login`)" class="registerTipItem">已有账号</a>
             </div>
             <button class="registerButton" @click="userRegister()" :class="{ buttonDisable: !userRegisterCan }"

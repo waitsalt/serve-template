@@ -1,12 +1,12 @@
 <script lang="ts" setup>
 import { onMounted, ref } from "vue";
-import type { CaptchaImageResponse } from "@/model/util";
-import { getCaptchaImage } from "@/service/util/captcha";
 import { notify } from "@/util/notify";
-import type { UserAuth, UserLoginPayload } from "@/model/user";
-import { postUserLogin } from "@/service/user";
-import { useUserStore } from "@/store/user";
 import { useRouter } from "vue-router";
+import { useUserStore } from "../store";
+import type { CaptchaImageResponse } from "@/module/captcha/model";
+import { getCaptchaImage } from "@/module/captcha/service";
+import type { UserAuth, UserLoginPayload } from "../model";
+import { postUserLogin } from "../service";
 
 const router = useRouter();
 const userStore = useUserStore();
@@ -75,7 +75,7 @@ onMounted(() => {
                 </div>
             </div>
             <div class="loginTip">
-                <a @click="router.push(`/user/register`)" class="loginTipItem">忘记密码</a>
+                <a @click="router.push(`/user/forget`)" class="loginTipItem">忘记密码</a>
                 <a @click="router.push(`/user/register`)" class="loginTipItem">没有账号</a>
             </div>
             <button class="loginButton" @click="userLogin()" :class="{ buttonDisable: !userLoginCan }"
