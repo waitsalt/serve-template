@@ -1,5 +1,12 @@
-use std::{error::Error, fmt, time::Duration};
-use tokio::sync::{mpsc, oneshot};
+use std::{
+    error::Error,
+    fmt::{self, Debug},
+    time::Duration,
+};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::AbortHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 const BATCH_SIZE: usize = 16;
@@ -59,14 +66,23 @@ pub trait Actor: Send + Sized + 'static {
         let (tx, mut rx) = mpsc::channel(config.channel_size);
         let cancel_token = CancellationToken::new();
         let token_for_task = cancel_token.clone();
+        let token_for_context = cancel_token.clone();
 
         let weak_sender = tx.downgrade();
-        let weak_addr = WeakAddr {
-            sender: weak_sender,
-            cancel_token: cancel_token.clone(),
-        };
+        let (abort_tx, abort_rx) = oneshot::channel::<AbortHandle>();
 
-        tokio::spawn(async move {
+        let join_handle = tokio::spawn(async move {
+            let abort_handle = match abort_rx.await {
+                Ok(handle) => handle,
+                Err(_) => return,
+            };
+
+            let weak_addr = WeakAddr {
+                sender: weak_sender,
+                abort_handle: Some(abort_handle),
+                cancel_token: token_for_context,
+            };
+
             let context = Context {
                 weak_addr: weak_addr.clone(),
             };
@@ -115,15 +131,21 @@ pub trait Actor: Send + Sized + 'static {
             }
         });
 
+        let abort_handle = join_handle.abort_handle();
+        let _ = abort_tx.send(abort_handle.clone());
+
         Addr {
             sender: tx,
+            abort_handle,
             cancel_token,
         }
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Addr<A: Actor> {
     sender: mpsc::Sender<A::Message>,
+    abort_handle: AbortHandle,
     cancel_token: CancellationToken,
 }
 #[derive(Debug)]
@@ -158,45 +180,19 @@ where
 
 impl<E> Error for ActorError<E> where E: Error + 'static {}
 
-impl<A: Actor> fmt::Debug for Addr<A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Addr")
-            .field(
-                "sender",
-                &format_args!("mpsc::Sender<{}>", std::any::type_name::<A::Message>()),
-            )
-            .field("cancel_token", &self.cancel_token)
-            .finish()
-    }
-}
-
-impl<A: Actor> Clone for Addr<A> {
-    fn clone(&self) -> Self {
-        Self {
-            sender: self.sender.clone(),
-            cancel_token: self.cancel_token.clone(),
-        }
-    }
-}
-
 impl<A> Addr<A>
 where
     A: Actor,
 {
     pub async fn send(&self, msg: A::Message) -> Result<(), ActorError<A::Error>> {
-        self.sender
-            .send(msg)
-            .await
-            .map_err(|_| ActorError::Closed)
+        self.sender.send(msg).await.map_err(|_| ActorError::Closed)
     }
 
     pub fn try_send(&self, msg: A::Message) -> Result<(), ActorError<A::Error>> {
-        self.sender
-            .try_send(msg)
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => ActorError::Full,
-                mpsc::error::TrySendError::Closed(_) => ActorError::Closed,
-            })
+        self.sender.try_send(msg).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => ActorError::Full,
+            mpsc::error::TrySendError::Closed(_) => ActorError::Closed,
+        })
     }
 
     pub async fn send_timeout(
@@ -223,11 +219,14 @@ where
         self.send(msg)
             .await
             .map_err(|_| ActorError::AskSendClosed)?;
-        rx.await
-            .map_err(|_| ActorError::AskRecvDropped)
+        rx.await.map_err(|_| ActorError::AskRecvDropped)
     }
 
-    pub async fn ask_timeout<R, F>(&self, f: F, timeout: Duration) -> Result<R, ActorError<A::Error>>
+    pub async fn ask_timeout<R, F>(
+        &self,
+        f: F,
+        timeout: Duration,
+    ) -> Result<R, ActorError<A::Error>>
     where
         R: Send + 'static,
         F: FnOnce(oneshot::Sender<R>) -> A::Message,
@@ -245,9 +244,18 @@ where
         self.cancel_token.is_cancelled()
     }
 
+    pub fn abort(&self) {
+        self.abort_handle.abort();
+    }
+
+    pub fn is_abort(&self) -> bool {
+        self.abort_handle.is_finished()
+    }
+
     pub fn downgrade(&self) -> WeakAddr<A> {
         WeakAddr {
             sender: self.sender.downgrade(),
+            abort_handle: Some(self.abort_handle.clone()),
             cancel_token: self.cancel_token.clone(),
         }
     }
@@ -255,6 +263,7 @@ where
 
 pub struct WeakAddr<A: Actor> {
     sender: mpsc::WeakSender<A::Message>,
+    abort_handle: Option<AbortHandle>,
     cancel_token: CancellationToken,
 }
 
@@ -274,6 +283,7 @@ impl<A: Actor> Clone for WeakAddr<A> {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            abort_handle: self.abort_handle.clone(),
             cancel_token: self.cancel_token.clone(),
         }
     }
@@ -281,9 +291,12 @@ impl<A: Actor> Clone for WeakAddr<A> {
 
 impl<A: Actor> WeakAddr<A> {
     pub fn upgrade(&self) -> Option<Addr<A>> {
-        if let Some(sender) = self.sender.upgrade() {
+        if let Some(sender) = self.sender.upgrade()
+            && let Some(abort_handle) = self.abort_handle.clone()
+        {
             Some(Addr {
                 sender,
+                abort_handle,
                 cancel_token: self.cancel_token.clone(),
             })
         } else {
@@ -316,4 +329,17 @@ where
         self.weak_addr.cancel_token.cancel();
     }
 
+    pub fn abort(&self) {
+        if let Some(abort_handle) = &self.weak_addr.abort_handle {
+            abort_handle.abort();
+        }
+    }
+
+    pub fn is_abort(&self) -> bool {
+        if let Some(abort_handle) = &self.weak_addr.abort_handle {
+            abort_handle.is_finished()
+        } else {
+            true
+        }
+    }
 }

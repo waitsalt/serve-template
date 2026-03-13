@@ -1,5 +1,5 @@
 use std::{error::Error, fmt, pin::Pin, time::Duration};
-use tokio::sync::{mpsc, oneshot};
+use tokio::{sync::{mpsc, oneshot}, task::AbortHandle};
 use tokio_util::sync::CancellationToken;
 
 const BATCH_SIZE: usize = 16;
@@ -62,13 +62,23 @@ pub trait Actor: Send + Sized + 'static {
         let (tx, mut rx) = mpsc::channel::<Box<dyn Envelope<Self>>>(config.channel_size);
         let cancel_token = CancellationToken::new();
         let token_for_task = cancel_token.clone();
+        let token_for_context = cancel_token.clone();
 
-        let weak_addr = WeakAddr {
-            sender: tx.downgrade(),
-            cancel_token: cancel_token.clone(),
-        };
+        let weak_sender = tx.downgrade();
+        let (abort_tx, abort_rx) = oneshot::channel::<AbortHandle>();
 
-        tokio::spawn(async move {
+        let join_handle = tokio::spawn(async move {
+            let abort_handle = match abort_rx.await {
+                Ok(handle) => handle,
+                Err(_) => return,
+            };
+
+            let weak_addr = WeakAddr {
+                sender: weak_sender,
+                abort_handle: Some(abort_handle.clone()),
+                cancel_token: token_for_context,
+            };
+
             let context = Context {
                 weak_addr: weak_addr.clone(),
             };
@@ -114,8 +124,12 @@ pub trait Actor: Send + Sized + 'static {
             }
         });
 
+        let abort_handle = join_handle.abort_handle();
+        let _ = abort_tx.send(abort_handle.clone());
+
         Addr {
             sender: tx,
+            abort_handle,
             cancel_token,
         }
     }
@@ -161,6 +175,7 @@ where
 #[derive(Debug)]
 pub struct Addr<A: Actor> {
     sender: mpsc::Sender<Box<dyn Envelope<A>>>,
+    abort_handle: AbortHandle,
     cancel_token: CancellationToken,
 }
 
@@ -195,6 +210,7 @@ impl<A: Actor> Clone for Addr<A> {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            abort_handle: self.abort_handle.clone(),
             cancel_token: self.cancel_token.clone(),
         }
     }
@@ -284,11 +300,28 @@ impl<A: Actor> Addr<A> {
     pub fn is_cancelled(&self) -> bool {
         self.cancel_token.is_cancelled()
     }
+
+    pub fn abort(&self) {
+        self.abort_handle.abort();
+    }
+
+    pub fn is_abort(&self) -> bool {
+        self.abort_handle.is_finished()
+    }
+
+    pub fn downgrade(&self) -> WeakAddr<A> {
+        WeakAddr {
+            sender: self.sender.downgrade(),
+            abort_handle: Some(self.abort_handle.clone()),
+            cancel_token: self.cancel_token.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct WeakAddr<A: Actor> {
     sender: mpsc::WeakSender<Box<dyn Envelope<A>>>,
+    abort_handle: Option<AbortHandle>,
     cancel_token: CancellationToken,
 }
 
@@ -296,6 +329,7 @@ impl<A: Actor> Clone for WeakAddr<A> {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            abort_handle: self.abort_handle.clone(),
             cancel_token: self.cancel_token.clone(),
         }
     }
@@ -303,9 +337,12 @@ impl<A: Actor> Clone for WeakAddr<A> {
 
 impl<A: Actor> WeakAddr<A> {
     pub fn upgrade(&self) -> Option<Addr<A>> {
-        if let Some(sender) = self.sender.upgrade() {
+        if let Some(sender) = self.sender.upgrade()
+            && let Some(abort_handle) = self.abort_handle.clone()
+        {
             Some(Addr {
                 sender,
+                abort_handle,
                 cancel_token: self.cancel_token.clone(),
             })
         } else {
@@ -330,5 +367,19 @@ impl<A: Actor> Context<A> {
 
     pub fn cancel(&self) {
         self.weak_addr.cancel_token.cancel();
+    }
+
+    pub fn abort(&self) {
+        if let Some(abort_handle) = &self.weak_addr.abort_handle {
+            abort_handle.abort();
+        }
+    }
+
+    pub fn is_abort(&self) -> bool {
+        if let Some(abort_handle) = &self.weak_addr.abort_handle {
+            abort_handle.is_finished()
+        } else {
+            true
+        }
     }
 }
