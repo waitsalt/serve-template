@@ -1,9 +1,6 @@
 use actor_dynamic::util::log_init;
-use anyhow::Result;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     log_init();
-
-    Ok(())
 }

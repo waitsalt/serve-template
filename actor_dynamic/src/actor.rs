@@ -1,5 +1,4 @@
-use anyhow::{Result, anyhow};
-use std::{pin::Pin, time::Duration};
+use std::{error::Error, fmt, pin::Pin, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -7,67 +6,100 @@ const BATCH_SIZE: usize = 16;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+#[derive(Debug, Clone, Copy)]
+pub struct ActorConfig {
+    pub channel_size: usize,
+    pub batch_size: usize,
+}
+
+impl ActorConfig {
+    pub fn new(channel_size: usize) -> Self {
+        Self {
+            channel_size,
+            batch_size: BATCH_SIZE,
+        }
+    }
+
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size.max(1);
+        self
+    }
+}
+
 pub trait Message: Send + 'static {
     type Result: Send;
 }
 
 pub trait Actor: Send + Sized + 'static {
-    fn on_start(&mut self, _ctx: &Context<Self>) -> impl Future<Output = Result<()>> + Send {
+    type Error: Error + Send + Sync + 'static;
+
+    fn on_start(
+        &mut self,
+        _ctx: &Context<Self>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async {
             tracing::trace!("Actor 启动");
             Ok(())
         }
     }
 
-    fn on_stop(&mut self, _ctx: &Context<Self>) -> impl Future<Output = Result<()>> + Send {
+    fn on_stop(
+        &mut self,
+        _ctx: &Context<Self>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async {
             tracing::trace!("Actor 停止");
             Ok(())
         }
     }
 
-    fn start(mut self, size: usize) -> Addr<Self> {
-        let (tx, mut rx) = mpsc::channel::<Box<dyn Envelope<Self>>>(size);
+    fn start(self, channel_size: usize) -> Addr<Self> {
+        self.start_with_config(ActorConfig::new(channel_size))
+    }
+
+    fn start_with_config(mut self, config: ActorConfig) -> Addr<Self> {
+        let batch_size = config.batch_size.max(1);
+        let (tx, mut rx) = mpsc::channel::<Box<dyn Envelope<Self>>>(config.channel_size);
         let cancel_token = CancellationToken::new();
         let token_for_task = cancel_token.clone();
 
         let weak_addr = WeakAddr {
             sender: tx.downgrade(),
-            cancel_token: token_for_task.clone(),
+            cancel_token: cancel_token.clone(),
         };
-        let context = Context { weak_addr };
 
         tokio::spawn(async move {
+            let context = Context {
+                weak_addr: weak_addr.clone(),
+            };
+
             if let Err(e) = self.on_start(&context).await {
                 tracing::error!(%e, "Actor 启动时发生错误");
                 return;
             }
 
-            let mut buffer = Vec::with_capacity(BATCH_SIZE);
+            let mut buffer = Vec::with_capacity(batch_size);
             let mut close_loop = false;
 
             loop {
                 tokio::select! {
-                    biased;
-
                     _ = token_for_task.cancelled() => {
                         tracing::trace!("Actor 收到停止信号");
                         break;
                     }
-                    count = rx.recv_many(&mut buffer, BATCH_SIZE) => {
+                    count = rx.recv_many(&mut buffer, batch_size) => {
                         if count == 0 {
                             tracing::trace!("Actor 消息通道已关闭");
                             close_loop = true;
                         }
 
-                        for msg in buffer.drain(..) {
-                            if token_for_task.is_cancelled() {
-                                break;
-                            }
+                        if token_for_task.is_cancelled() {
+                            tracing::trace!("Actor 收到停止信号");
+                            break;
+                        }
 
-                            if let Err(e) = msg.handle(&mut self, &context).await {
-                                tracing::error!(%e, "Actor 处理消息错误");
-                            }
+                        for msg in buffer.drain(..) {
+                            msg.handle(&mut self, &context).await;
                         }
 
                         if close_loop {
@@ -98,7 +130,7 @@ pub trait Envelope<A: Actor>: Send {
         self: Box<Self>,
         actor: &'a mut A,
         ctx: &'a Context<A>,
-    ) -> BoxFuture<'a, Result<()>>;
+    ) -> BoxFuture<'a, ()>;
 }
 
 struct MsgEnvelope<M: Message> {
@@ -115,15 +147,13 @@ where
         self: Box<Self>,
         actor: &'a mut A,
         ctx: &'a Context<A>,
-    ) -> BoxFuture<'a, Result<()>> {
+    ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let result = actor.handle(self.msg, ctx).await;
 
             if let Some(tx) = self.tx {
                 let _ = tx.send(result);
             }
-
-            Ok(())
         })
     }
 }
@@ -133,6 +163,33 @@ pub struct Addr<A: Actor> {
     sender: mpsc::Sender<Box<dyn Envelope<A>>>,
     cancel_token: CancellationToken,
 }
+
+#[derive(Debug)]
+pub enum ActorError {
+    Closed,
+    Full,
+    Timeout,
+    AskSendClosed,
+    AskRecvDropped,
+    AskTimeout,
+}
+
+impl fmt::Display for ActorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ActorError::Closed => write!(f, "Actor 发送消息失败: 通道已关闭"),
+            ActorError::Full => write!(f, "Actor 发送消息失败: 通道已满"),
+            ActorError::Timeout => write!(f, "Actor 发送消息失败: 超时"),
+            ActorError::AskSendClosed => write!(f, "Actor 发送消息失败: 通道已关闭"),
+            ActorError::AskRecvDropped => {
+                write!(f, "Actor 等待响应失败(发送端被丢弃/未发送)")
+            }
+            ActorError::AskTimeout => write!(f, "Actor 请求超时"),
+        }
+    }
+}
+
+impl Error for ActorError {}
 
 impl<A: Actor> Clone for Addr<A> {
     fn clone(&self) -> Self {
@@ -144,7 +201,7 @@ impl<A: Actor> Clone for Addr<A> {
 }
 
 impl<A: Actor> Addr<A> {
-    pub async fn send<M>(&self, msg: M) -> Result<()>
+    pub async fn send<M>(&self, msg: M) -> Result<(), ActorError>
     where
         A: Handler<M>,
         M: Message,
@@ -154,10 +211,10 @@ impl<A: Actor> Addr<A> {
         self.sender
             .send(Box::new(env))
             .await
-            .map_err(|_| anyhow!("Actor 被关闭"))
+            .map_err(|_| ActorError::Closed)
     }
 
-    pub fn try_send<M>(&self, msg: M) -> Result<()>
+    pub fn try_send<M>(&self, msg: M) -> Result<(), ActorError>
     where
         A: Handler<M>,
         M: Message,
@@ -166,10 +223,29 @@ impl<A: Actor> Addr<A> {
 
         self.sender
             .try_send(Box::new(env))
-            .map_err(|_| anyhow!("Actor 通道满了/被关闭"))
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => ActorError::Full,
+                mpsc::error::TrySendError::Closed(_) => ActorError::Closed,
+            })
     }
 
-    pub async fn ask<M>(&self, msg: M) -> Result<M::Result>
+    pub async fn send_timeout<M>(&self, msg: M, timeout: Duration) -> Result<(), ActorError>
+    where
+        A: Handler<M>,
+        M: Message,
+    {
+        let env = MsgEnvelope { msg, tx: None };
+
+        self.sender
+            .send_timeout(Box::new(env), timeout)
+            .await
+            .map_err(|e| match e {
+                mpsc::error::SendTimeoutError::Timeout(_) => ActorError::Timeout,
+                mpsc::error::SendTimeoutError::Closed(_) => ActorError::Closed,
+            })
+    }
+
+    pub async fn ask<M>(&self, msg: M) -> Result<M::Result, ActorError>
     where
         A: Handler<M>,
         M: Message,
@@ -181,27 +257,31 @@ impl<A: Actor> Addr<A> {
         self.sender
             .send(Box::new(env))
             .await
-            .map_err(|e| anyhow!("Actor 发送消息失败: {:#}", e))?;
+            .map_err(|_| ActorError::AskSendClosed)?;
 
         rx.await
-            .map_err(|e| anyhow!("等待响应失败(Actor可能已丢弃请求): {:#}", e))
+            .map_err(|_| ActorError::AskRecvDropped)
     }
 
-    pub async fn ask_with_timeout<M>(&self, msg: M, timeout: Duration) -> Result<M::Result>
+    pub async fn ask_timeout<M>(
+        &self,
+        msg: M,
+        timeout: Duration,
+    ) -> Result<M::Result, ActorError>
     where
         A: Handler<M>,
         M: Message,
     {
         tokio::time::timeout(timeout, self.ask(msg))
             .await
-            .map_err(|_| anyhow!("Actor 请求超时"))?
+            .map_err(|_| ActorError::AskTimeout)?
     }
 
-    pub fn stop(&self) {
+    pub fn cancel(&self) {
         self.cancel_token.cancel();
     }
 
-    pub fn is_stopped(&self) -> bool {
+    pub fn is_cancelled(&self) -> bool {
         self.cancel_token.is_cancelled()
     }
 }
@@ -248,7 +328,7 @@ impl<A: Actor> Context<A> {
         self.weak_addr.clone()
     }
 
-    pub fn stop(&self) {
+    pub fn cancel(&self) {
         self.weak_addr.cancel_token.cancel();
     }
 }
